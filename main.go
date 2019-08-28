@@ -4,7 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
+
+type counter struct {
+	val uint64
+}
+
+func (c *counter) Increment() {
+	atomic.AddUint64(&c.val, 1)
+}
+
+func (c *counter) Val() uint64 {
+	return atomic.LoadUint64(&c.val)
+}
 
 const Separator = "."
 
@@ -19,30 +33,47 @@ func (key MKey) Split() []string {
 }
 
 type SafeMetrics struct {
-	Data        map[MKey]uint64 `json:"data"`
-	PrettyPrint bool            `json:"-"`
+	mutex       sync.RWMutex
+	Data        map[MKey]*counter `json:"data"`
+	PrettyPrint bool              `json:"-"`
 
-	bus chan MKey
-	ctx context.Context
+	ctx       context.Context
+	bus       chan MKey
+	busClosed bool
 }
 
-func (m *SafeMetrics) New(ctx context.Context) *SafeMetrics {
-	m.Data = make(map[MKey]uint64)
+func (SafeMetrics) New(ctx context.Context) *SafeMetrics {
+	m := SafeMetrics{}
+	m.mutex = sync.RWMutex{}
+	m.Data = make(map[MKey]*counter)
 	m.bus = make(chan MKey, 16)
 	m.ctx = ctx
-	return m
+	return &m
 }
 
-func (m SafeMetrics) Add(name MKey) {
+func (m *SafeMetrics) Add(name MKey) {
+	if m.busClosed {
+		return
+	}
+
 	m.bus <- name
 }
+func (m *SafeMetrics) Value(name MKey) uint64 {
+	return m.Data[name].Val()
+}
 
-func (m SafeMetrics) Collect() {
+func (m *SafeMetrics) Collect() {
 	for {
 		select {
 		case name := <-m.bus:
-			m.Data[name]++
+			m.mutex.Lock()
+			if _, ok := m.Data[name]; !ok {
+				m.Data[name] = &counter{}
+			}
+			m.Data[name].Increment()
+			m.mutex.Unlock()
 		case <-m.ctx.Done():
+			m.busClosed = true
 			close(m.bus)
 			return
 		}
@@ -50,12 +81,20 @@ func (m SafeMetrics) Collect() {
 
 }
 
-func (m *SafeMetrics) MarshalJSON() ([]byte, error) {
-	if !m.PrettyPrint {
-		return json.Marshal(m.Data)
+func (m SafeMetrics) MarshalJSON() ([]byte, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	data := map[MKey]uint64{}
+	for mKey := range m.Data {
+		data[mKey] = m.Value(mKey)
 	}
-	res := make(map[string]map[string]interface{})
-	nodes := m.parseNodes()
+
+	if !m.PrettyPrint {
+		return json.Marshal(data)
+	}
+
+	res := make(map[string]interface{})
+	nodes := m.parseNodes(data)
 	for key, n := range nodes {
 		res[key] = n.toJSON()
 	}
@@ -63,9 +102,9 @@ func (m *SafeMetrics) MarshalJSON() ([]byte, error) {
 	return json.Marshal(res)
 }
 
-func (m SafeMetrics) parseNodes() map[string]node {
+func (m SafeMetrics) parseNodes(data map[MKey]uint64) map[string]node {
 	result := make(map[string]node)
-	for mKey, count := range m.Data {
+	for mKey, count := range data {
 		mKeyParts := mKey.Split()
 		topName := mKeyParts[0]
 		t := result[topName]
@@ -82,8 +121,12 @@ type node struct {
 	children map[string]*node
 }
 
-func (mn *node) toJSON() map[string]interface{} {
+func (mn *node) toJSON() interface{} {
 	res := make(map[string]interface{})
+	if mn.children == nil {
+		return mn.value
+	}
+
 	if mn.value != nil {
 		res["value"] = *mn.value
 	}
